@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math/rand"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -15,16 +16,20 @@ import (
 )
 
 var (
-	urlBase    = "http://www.perseus.tufts.edu/hopper/xmlmorph?lang=la&lookup="
-	input      = kingpin.Arg("input", "File or Folder containing latin text to be lemmatized").Required().File()
-	outputPath = kingpin.Arg("output", "File or Folder to output the lemmatized text").Required().String()
+	urlBase      = "http://www.perseus.tufts.edu/hopper/xmlmorph?lang=la&lookup="
+	MAX_REQUESTS = kingpin.Flag("requestCount", "The max number of concurrant requests that lemmy should send to www.perseus.tufts.edu (More isn't always better)").Default("10").Short('r').Int()
+	verbose      = kingpin.Flag("verbose", "Print extra debugging information").Short('v').Bool()
+	input        = kingpin.Arg("input", "File or Folder containing latin text to be lemmatized").Required().File()
+	outputPath   = kingpin.Arg("output", "File or Folder to output the lemmatized text").Required().String()
 )
 
 func main() {
-	kingpin.Version("0.0.1")
+	kingpin.Version("1.0")
 	kingpin.Parse()
 
 	defer input.Close()
+
+	rand.Seed(time.Now().UnixNano())
 
 	inputInfo, err := input.Stat()
 	if err != nil {
@@ -87,17 +92,15 @@ func LemmatizeFile(inputFile *os.File, outputPath string) {
 	}
 	lr := NewLemmaReader(inputFile)
 	fmt.Printf("Lemmatizing '%s' into '%s'", inputFile.Name(), outputPath)
-	ticker := time.NewTicker(time.Millisecond * 500)
-	go func() {
-		for _ = range ticker.C {
-			fmt.Print(".")
-		}
-	}()
+	i := 1
 	for w, done := lr.Read(); !done; w, done = lr.Read() {
 		outFile.WriteString(w + " ")
+		if i%50 == 0 {
+			fmt.Print(".")
+		}
+		i++
 	}
 	outFile.WriteString("\n")
-	ticker.Stop()
 	fmt.Println()
 }
 
@@ -106,49 +109,122 @@ func LemmatizeText(f io.Reader) *LemmaReader {
 }
 
 type LemmaReader struct {
-	s scanner.Scanner
+	outChan chan *postLemMsg
+	s       scanner.Scanner
 }
 
 func NewLemmaReader(f io.Reader) *LemmaReader {
-	lr := &LemmaReader{}
-	lr.s.Init(f)
-	return lr
+	l := &LemmaReader{outChan: make(chan *postLemMsg)}
+
+	inChan := make(chan *preLemMsg)
+	l.s.Init(f)
+	go l.populateInChan(inChan)
+	go l.processInChan(inChan)
+	return l
+}
+
+func (l *LemmaReader) populateInChan(inChan chan *preLemMsg) {
+	waitOn := make(chan struct{})
+	//kick off the first word
+	go func(waitOn chan struct{}) {
+		waitOn <- struct{}{}
+	}(waitOn)
+
+	var proceed chan struct{}
+	for l.s.Scan() != scanner.EOF {
+		token := l.s.TokenText()
+		if token != "" {
+			proceed = make(chan struct{})
+			inChan <- &preLemMsg{token, waitOn, proceed}
+			waitOn = proceed
+		}
+	}
+	close(inChan)
+	//drain the last waitOn channel so the final goroutine doesn't block on it
+	<-waitOn
+}
+
+func (l *LemmaReader) processInChan(inChan chan *preLemMsg) {
+
+	doneChan := make(chan struct{})
+	httpClient := &http.Client{}
+
+	//create MAX_REQUESTS worker goroutines
+	for i := 0; i < *MAX_REQUESTS; i++ {
+		go func(inChan chan *preLemMsg, doneChan chan struct{}, httpClient *http.Client, i int) {
+			for msg := range inChan {
+				lemmyd, err := LemmatizeWord(httpClient, msg.word)
+				for err != nil {
+					if *verbose {
+						fmt.Fprintf(os.Stderr, "\nError on word '%s'\ntype is '%T'\nerr is '%s'\nRETRYING\n", msg.word, err, err)
+					}
+					time.Sleep(time.Duration(500+rand.Intn(500)) * time.Millisecond)
+					lemmyd, err = LemmatizeWord(httpClient, msg.word)
+				}
+				<-msg.waitOn
+				if lemmyd != "" {
+					l.outChan <- &postLemMsg{lemmyd, false}
+				}
+				msg.proceed <- struct{}{}
+			}
+			doneChan <- struct{}{}
+		}(inChan, doneChan, httpClient, i)
+	}
+
+	//wait for all goroutines to complete
+	for i := 0; i < *MAX_REQUESTS; i++ {
+		<-doneChan
+	}
+
+	l.outChan <- &postLemMsg{"", true}
 }
 
 func (l *LemmaReader) Read() (string, bool) {
-	done := false
-	lemmyd := ""
-
-	for lemmyd == "" && !done {
-		if l.s.Scan() == scanner.EOF {
-			done = true
-		}
-		lemmyd = LemmatizeWord(l.s.TokenText())
-	}
-
-	return lemmyd, done
+	msg := <-l.outChan
+	return msg.word, msg.done
 }
 
-func LemmatizeWord(word string) string {
-	resp, err := http.Get(urlBase + word)
-	if err != nil {
-		panic(err)
+type preLemMsg struct {
+	word    string
+	waitOn  chan struct{}
+	proceed chan struct{}
+}
 
+type postLemMsg struct {
+	word string
+	done bool
+}
+
+func LemmatizeWord(httpClient *http.Client, word string) (string, error) {
+	//resp, err := http.Get(urlBase + word)
+	req, err := http.NewRequest("GET", urlBase+word, nil)
+	if err != nil {
+		return "", err
+	}
+
+	req.Close = true
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", err
 	}
 	defer resp.Body.Close()
 
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		panic(err)
+		return "", err
 	}
 
 	lemXml := Analyses{}
 	err = xml.Unmarshal(body, &lemXml)
 	if err != nil {
-		panic(err)
+		if *verbose {
+			fmt.Fprintf(os.Stderr, "\n%s\n", body)
+		}
+		return "", err
 	}
 
-	return lemXml.Analysis.Lemma
+	return lemXml.Analysis.Lemma, nil
 }
 
 type Analysis struct {

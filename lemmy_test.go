@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net/http"
 	"strings"
 	"testing"
 )
@@ -12,8 +13,9 @@ var words = map[string]string{
 }
 
 func TestLemmatizeWord(t *testing.T) {
+	httpClient := &http.Client{}
 	for base, lemmyd := range words {
-		lemTest := LemmatizeWord(base)
+		lemTest, _ := LemmatizeWord(httpClient, base)
 		t.Logf("%s:%s:%s", base, lemTest, lemmyd)
 		if lemTest != lemmyd {
 			t.Error("Lemmatize Failed for word " + base)
@@ -24,6 +26,8 @@ func TestLemmatizeWord(t *testing.T) {
 func TestLemmatizeText(t *testing.T) {
 	var in string
 	var out []string
+	mx := 10
+	MAX_REQUESTS = &mx
 	for base, lemmyd := range words {
 		in += base + " "
 		out = append(out, lemmyd)
@@ -35,7 +39,7 @@ func TestLemmatizeText(t *testing.T) {
 	for w, done := lr.Read(); !done; w, done = lr.Read() {
 		t.Logf("%s:%s", w, out[i])
 		if w != out[i] {
-			t.Error("Lemmatize Failed for word index " + string(i))
+			t.Errorf("Lemmatize Failed for word index %d", i)
 		}
 		i++
 	}
