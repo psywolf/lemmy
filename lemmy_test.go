@@ -28,7 +28,9 @@ func TestLemmatizeText(t *testing.T) {
 	var in string
 	var out []string
 	mx := 10
+	cache_size := 10000
 	MAX_REQUESTS = &mx
+	CACHE_SIZE = &cache_size
 	for base, lemmyd := range words {
 		in += base + " "
 		out = append(out, lemmyd)

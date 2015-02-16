@@ -12,19 +12,21 @@ import (
 	"text/scanner"
 	"time"
 
-	"github.com/alecthomas/kingpin"
+	"github.com/psywolf/autocache"
+	"gopkg.in/alecthomas/kingpin.v1"
 )
 
 var (
 	urlBase      = "http://www.perseus.tufts.edu/hopper/xmlmorph?lang=la&lookup="
 	MAX_REQUESTS = kingpin.Flag("requestCount", "The max number of concurrant requests that lemmy should send to www.perseus.tufts.edu (More isn't always better)").Default("10").Short('r').Int()
+	CACHE_SIZE   = kingpin.Flag("cacheSize", "The max number of lemmatized words to cache").Default("10000").Short('c').Int()
 	verbose      = kingpin.Flag("verbose", "Print extra debugging information").Short('v').Bool()
 	input        = kingpin.Arg("input", "File or Folder containing latin text to be lemmatized").Required().File()
 	outputPath   = kingpin.Arg("output", "File or Folder to output the lemmatized text").Required().String()
 )
 
 func main() {
-	kingpin.Version("1.0.1")
+	kingpin.Version("1.0.2")
 	kingpin.Parse()
 
 	defer input.Close()
@@ -110,6 +112,7 @@ func LemmatizeText(f io.Reader) *LemmaReader {
 
 type LemmaReader struct {
 	outChan chan *postLemMsg
+	cache   *autocache.Cache
 	s       scanner.Scanner
 }
 
@@ -122,6 +125,20 @@ func NewLemmaReader(f io.Reader) *LemmaReader {
 	//the default mode ignores go style comments
 	//and chokes on unmatched quotes or backticks
 	l.s.Mode = scanner.ScanIdents | scanner.ScanInts | scanner.ScanFloats
+
+	httpClient := &http.Client{}
+	l.cache = autocache.New(*CACHE_SIZE, func(word string) (string, error) {
+		lemmyd, err := LemmatizeWord(httpClient, word)
+		for err != nil {
+			if *verbose {
+				fmt.Fprintf(os.Stderr, "\nError on word '%s'\ntype is '%T'\nerr is '%s'\nRETRYING\n", word, err, err)
+			}
+			time.Sleep(time.Duration(500+rand.Intn(500)) * time.Millisecond)
+			lemmyd, err = LemmatizeWord(httpClient, word)
+		}
+		return lemmyd, nil
+	})
+
 	go l.populateInChan(inChan)
 	go l.processInChan(inChan)
 	return l
@@ -151,19 +168,14 @@ func (l *LemmaReader) populateInChan(inChan chan *preLemMsg) {
 func (l *LemmaReader) processInChan(inChan chan *preLemMsg) {
 
 	doneChan := make(chan struct{})
-	httpClient := &http.Client{}
 
 	//create MAX_REQUESTS worker goroutines
 	for i := 0; i < *MAX_REQUESTS; i++ {
-		go func(inChan chan *preLemMsg, doneChan chan struct{}, httpClient *http.Client, i int) {
+		go func(inChan chan *preLemMsg, doneChan chan struct{}) {
 			for msg := range inChan {
-				lemmyd, err := LemmatizeWord(httpClient, msg.word)
-				for err != nil {
-					if *verbose {
-						fmt.Fprintf(os.Stderr, "\nError on word '%s'\ntype is '%T'\nerr is '%s'\nRETRYING\n", msg.word, err, err)
-					}
-					time.Sleep(time.Duration(500+rand.Intn(500)) * time.Millisecond)
-					lemmyd, err = LemmatizeWord(httpClient, msg.word)
+				lemmyd, err := l.cache.Get(msg.word)
+				if err != nil {
+					panic(err)
 				}
 				<-msg.waitOn
 				if lemmyd != "" {
@@ -172,7 +184,7 @@ func (l *LemmaReader) processInChan(inChan chan *preLemMsg) {
 				msg.proceed <- struct{}{}
 			}
 			doneChan <- struct{}{}
-		}(inChan, doneChan, httpClient, i)
+		}(inChan, doneChan)
 	}
 
 	//wait for all goroutines to complete
