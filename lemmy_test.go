@@ -10,6 +10,7 @@ var words = map[string]string{
 	"et":        "et",
 	"oratio":    "oratio",
 	"conviciis": "convicium",
+	"est":       "sum",
 }
 
 func TestLemmatizeWord(t *testing.T) {
@@ -32,6 +33,7 @@ func TestLemmatizeText(t *testing.T) {
 		in += base + " "
 		out = append(out, lemmyd)
 	}
+	in = "//'\"`" + in
 	t.Log(in)
 	lr := NewLemmaReader(strings.NewReader(in))
 

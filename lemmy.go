@@ -24,7 +24,7 @@ var (
 )
 
 func main() {
-	kingpin.Version("1.0")
+	kingpin.Version("1.0.1")
 	kingpin.Parse()
 
 	defer input.Close()
@@ -118,6 +118,10 @@ func NewLemmaReader(f io.Reader) *LemmaReader {
 
 	inChan := make(chan *preLemMsg)
 	l.s.Init(f)
+	//change the mode to only look for words and numbers
+	//the default mode ignores go style comments
+	//and chokes on unmatched quotes or backticks
+	l.s.Mode = scanner.ScanIdents | scanner.ScanInts | scanner.ScanFloats
 	go l.populateInChan(inChan)
 	go l.processInChan(inChan)
 	return l
@@ -223,16 +227,17 @@ func LemmatizeWord(httpClient *http.Client, word string) (string, error) {
 		}
 		return "", err
 	}
-
-	return lemXml.Analysis.Lemma, nil
+	if len(lemXml.Analysis) == 0 {
+		return "", nil
+	}
+	return lemXml.Analysis[len(lemXml.Analysis)-1].Lemma, nil
 }
 
 type Analysis struct {
-	XMLName xml.Name `xml:"analysis"`
-	Lemma   string   `xml:"lemma"`
+	Lemma string `xml:"lemma"`
 }
 
 type Analyses struct {
-	XMLName  xml.Name `xml:"analyses"`
-	Analysis Analysis
+	XMLName  xml.Name   `xml:"analyses"`
+	Analysis []Analysis `xml:"analysis"`
 }
