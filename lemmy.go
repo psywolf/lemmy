@@ -7,6 +7,7 @@ import (
 	"io/ioutil"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"text/scanner"
@@ -26,10 +27,20 @@ var (
 )
 
 func main() {
-	kingpin.Version("1.0.2")
+	kingpin.Version("1.0.3")
 	kingpin.Parse()
 
 	defer input.Close()
+
+	if *MAX_REQUESTS < 1 {
+		fmt.Fprintf(os.Stderr, "ERROR: requestCount of %d is invalid.  Must be greater than 0.\n", *MAX_REQUESTS)
+		os.Exit(1)
+	}
+
+	if *CACHE_SIZE < 0 {
+		fmt.Fprintf(os.Stderr, "ERROR: cacheSize of %d is invalid.  Must be at least 0.\n", *CACHE_SIZE)
+		os.Exit(1)
+	}
 
 	rand.Seed(time.Now().UnixNano())
 
@@ -45,7 +56,7 @@ func main() {
 
 	if !os.IsNotExist(err) && outputInfo.IsDir() != inputInfo.IsDir() {
 		fmt.Fprintf(os.Stderr, "ERROR: Output and Input must both be either files or folders\n")
-		return
+		os.Exit(1)
 	}
 
 	if !inputInfo.IsDir() {
@@ -124,7 +135,7 @@ func NewLemmaReader(f io.Reader) *LemmaReader {
 	//change the mode to only look for words and numbers
 	//the default mode ignores go style comments
 	//and chokes on unmatched quotes or backticks
-	l.s.Mode = scanner.ScanIdents | scanner.ScanInts | scanner.ScanFloats
+	l.s.Mode = scanner.ScanIdents
 
 	httpClient := &http.Client{}
 	l.cache = autocache.New(*CACHE_SIZE, func(word string) (string, error) {
@@ -146,15 +157,21 @@ func NewLemmaReader(f io.Reader) *LemmaReader {
 
 func (l *LemmaReader) populateInChan(inChan chan *preLemMsg) {
 	waitOn := make(chan struct{})
-	//kick off the first word
-	go func(waitOn chan struct{}) {
-		waitOn <- struct{}{}
-	}(waitOn)
+
+	if *MAX_REQUESTS > 1 {
+		//kick off the first word
+		go func(waitOn chan struct{}) {
+			waitOn <- struct{}{}
+		}(waitOn)
+	}
 
 	var proceed chan struct{}
 	for l.s.Scan() != scanner.EOF {
 		token := l.s.TokenText()
 		if token != "" {
+			if *verbose {
+				fmt.Printf("token is '%s'\n", token)
+			}
 			proceed = make(chan struct{})
 			inChan <- &preLemMsg{token, waitOn, proceed}
 			waitOn = proceed
@@ -162,7 +179,10 @@ func (l *LemmaReader) populateInChan(inChan chan *preLemMsg) {
 	}
 	close(inChan)
 	//drain the last waitOn channel so the final goroutine doesn't block on it
-	<-waitOn
+
+	if *MAX_REQUESTS > 1 {
+		<-waitOn
+	}
 }
 
 func (l *LemmaReader) processInChan(inChan chan *preLemMsg) {
@@ -171,20 +191,37 @@ func (l *LemmaReader) processInChan(inChan chan *preLemMsg) {
 
 	//create MAX_REQUESTS worker goroutines
 	for i := 0; i < *MAX_REQUESTS; i++ {
-		go func(inChan chan *preLemMsg, doneChan chan struct{}) {
+		go func(inChan chan *preLemMsg, doneChan chan struct{}, i int) {
 			for msg := range inChan {
+				if *verbose {
+					fmt.Printf("thread #%d word '%s': get from cache\n", i, msg.word)
+				}
 				lemmyd, err := l.cache.Get(msg.word)
 				if err != nil {
 					panic(err)
 				}
-				<-msg.waitOn
+				if *MAX_REQUESTS > 1 {
+					if *verbose {
+						fmt.Printf("thread #%d word '%s': waiting to output '%s'\n", i, msg.word, lemmyd)
+					}
+					<-msg.waitOn
+				}
 				if lemmyd != "" {
 					l.outChan <- &postLemMsg{lemmyd, false}
 				}
-				msg.proceed <- struct{}{}
+				if *MAX_REQUESTS > 1 {
+					if *verbose {
+						fmt.Printf("thread #%d word '%s': signaling next thread to proceed\n", i, msg.word)
+					}
+					msg.proceed <- struct{}{}
+				}
+
+				if *verbose {
+					fmt.Printf("thread #%d word '%s': exiting thread\n", i, msg.word)
+				}
 			}
 			doneChan <- struct{}{}
-		}(inChan, doneChan)
+		}(inChan, doneChan, i)
 	}
 
 	//wait for all goroutines to complete
@@ -212,8 +249,11 @@ type postLemMsg struct {
 }
 
 func LemmatizeWord(httpClient *http.Client, word string) (string, error) {
-	//resp, err := http.Get(urlBase + word)
-	req, err := http.NewRequest("GET", urlBase+word, nil)
+	if *verbose {
+		fmt.Printf("lemmatizing word '%s'\n", word)
+	}
+	req, err := http.NewRequest("GET", urlBase+url.QueryEscape(word), nil)
+
 	if err != nil {
 		return "", err
 	}
@@ -225,6 +265,10 @@ func LemmatizeWord(httpClient *http.Client, word string) (string, error) {
 		return "", err
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("StatusCode %d when trying to lemmatize word '%s' (expected 200)", resp.StatusCode, word)
+	}
 
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
@@ -242,7 +286,7 @@ func LemmatizeWord(httpClient *http.Client, word string) (string, error) {
 	if len(lemXml.Analysis) == 0 {
 		return "", nil
 	}
-	return lemXml.Analysis[len(lemXml.Analysis)-1].Lemma, nil
+	return lemXml.Analysis[0].Lemma, nil
 }
 
 type Analysis struct {
